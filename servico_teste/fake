@@ -1,0 +1,194 @@
+#!/usr/bin/env perl
+use Mojolicious::Lite;
+
+plugin 'Config';
+
+# Documentation browser under "/perldoc"
+plugin 'PODRenderer';
+my $STATUS_DVR = 1;
+my $DNS_DVR = 'localhost';
+
+helper status_dvr => sub { return $STATUS_DVR };
+
+get '/' => sub {
+  my $c = shift;
+  $c->render(template => 'index');
+};
+
+get 'dns' => sub {
+  my $c = shift;
+  $c->render(text => $DNS_DVR);
+};
+
+get 'dns_ajuste' => sub {
+  my $c = shift;
+  $c->param(dns => $DNS_DVR);
+  $c->render(template => 'dns', mensagem => '');
+};
+
+post 'dns_ajuste' => sub {
+  my $c = shift;
+  $DNS_DVR = $c->param('dns');
+  $c->render(template => 'dns', mensagem => "ajustado para $DNS_DVR");
+};
+
+get '/status' => sub {
+  my $c = shift;
+  $c->render(template => 'status');
+};
+
+post '/status' => sub {
+  my $c = shift;
+  my $acao = $c->param('acao');
+  $STATUS_DVR = $acao eq 'ligar' ? 1 : 0;
+  $c->render(template => 'status');
+};
+
+get '/comandos' => sub {
+  my $c = shift;
+  $c->stash(mensagem => '');
+  $c->render(template => 'comandos');
+};
+
+post '/comandos' => sub {
+  my $c = shift;
+  my $mensagem = undef;
+
+  my $from = {id => $c->param('usuario'), first_name => 'dummy', last_name => 'dummy'};
+  unless ($from->{id}) {
+    $from->{id} = $c->param('livre_id');
+    $from->{first_name} = $c->param('livre_first_name');
+    $from->{last_name} = $c->param('livre_last_name');
+    unless ($from->{id}) {
+      $mensagem ||= 'Usuario livre nao informado';
+    }
+    unless ($from->{first_name}) {
+      $mensagem ||= 'primeiro nome livre nao informado';
+    }
+    unless ($from->{last_name}) {
+      $mensagem ||= 'ultimo nome livre nao informado';
+    }
+  }
+
+  my $text = $c->param('texto');
+  unless ($text) {
+    $mensagem ||= 'comando nao informado';
+  }
+
+  unless ($mensagem) {
+    my $dados = {"update_id" => "99", "message" => {"from" => $from, "text" => $text}};
+
+    $c->ua->post($c->config->{url_servico} => json => $dados);
+
+    use Mojo::JSON 'to_json';
+    $mensagem = 'Enviado para webHook: ' . to_json($dados);
+  }
+
+  $c->render(template => 'comandos', mensagem => $mensagem);
+};
+
+post '/fake/:bot_key/:command' => sub {
+  my $c = shift;
+  my $dados = $c->req->json;
+  my ($bot_key, $command) = ($c->param('bot_key'), $c->param('command'));
+  if ($bot_key ne $c->config->{bot_key}) {
+    return $c->reply->exception('Chamada invalida!');
+  }
+  $c->app->log->debug("\n\n\n\t\tdestinario: " . $dados->{chat_id} . "\n\t\ttexto: " . $dados->{text} . "\n\n");
+  $c->render(json => {ok => "true"});
+};
+
+app->log->debug('rodando');
+app->start;
+__DATA__
+
+@@ index.html.ep
+% layout 'default';
+% title 'Site de teste';
+<h1>Site de teste</h1>
+<a href="/dns_ajuste">DNS</a> -
+<a href="/status">Status DVR</a> -
+<a href="/comandos">enviar comandos</a> -
+% if (status_dvr()) {
+  <br/> <br/> <br/> INTELBRAS disponivel
+% }
+
+@@ status.html.ep
+% layout 'default';
+% title 'Site de teste - status dvr';
+<h1>Status do DVR</h1>
+<form method="post">
+  % if (status_dvr()) {
+    <input type="submit" name="acao" value="desligar" />
+  % } else { 
+    <input type="submit" name="acao" value="ligar" />
+  % }
+</form>
+
+@@ comandos.html.ep
+% layout 'default';
+% title 'Site de teste - testar comandos';
+<script src="/mojo/jquery/jquery.js"></script>
+<script>
+  $(document).ready(function () {
+    $('#comando').change(function () {
+      $('#texto').val($(this).val());
+    });
+
+    $('#usuario').change(function () {
+      var usuario = $(this).val();
+      if (usuario) {
+        $('#linhaUsuarioLivre').hide();
+      } else {
+        $('#linhaUsuarioLivre').show();
+      }
+    });
+
+    if ($('#usuario').val()) {
+      $('#linhaUsuarioLivre').hide();
+    }
+  });
+</script>
+<h1>Comandos</h1>
+<p><strong><%= $mensagem %></strong></p>
+<form method="post">
+  <table>
+    <tr>
+      <td>Usario</td>
+      <td><%= select_field usuario => [['livre' => ''], ['fabio' => '22'], ['fran' => '33'], ['terceiro' => '44']], id => 'usuario' %></td>
+    </tr>
+    <tr id="linhaUsuarioLivre">
+      <td>&nbsp;</td>
+      <td><table><tr><td>id:</td><td><%= number_field 'livre_id' %></td></tr><tr><td>primeiro nome:</td><td><%= text_field 'livre_first_name' %></td></tr><tr><td>ultimo nome:</td><td><%= text_field 'livre_last_name' %></td></tr></table></td>
+    </tr>
+    <tr>
+      <td>comando</td>
+      <td><%= select_field comando => ['', '/start','/ip','/status','/ligar','/desligar'], id => 'comando' %></td>
+    </tr>
+    <tr>
+      <td>&nbsp;</td>
+      <td><%= text_area 'texto', cols => 40, id => 'texto' %></td>
+    </tr>
+  </table>
+  <input type="submit" value="enviar" />
+</form>
+
+@@ dns.html.ep
+% layout 'default';
+% title 'Site de teste - DNS';
+<h1>DNS</h1>
+<p><strong><%= $mensagem %></strong></p>
+<form method="post">
+  DNS: <%= text_field 'dns' %>
+ <input type="submit" value="enviar" />
+</form>
+
+@@ layouts/default.html.ep
+<!DOCTYPE html>
+<html>
+  <head><title><%= title %></title></head>
+  <body>
+    <a href="/" style="float: right">Inicio</a>
+    <%= content %>
+  </body>
+</html>

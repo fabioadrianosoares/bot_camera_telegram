@@ -1,0 +1,215 @@
+#!/usr/bin/env perl
+use Mojolicious::Lite;
+use Mango;
+
+my $falhas_dns = 0;
+my $falha_http = undef;
+
+plugin 'Config';
+
+my $BOT_KEY = app->config->{bot_key};
+
+# Documentation browser under "/perldoc"
+plugin 'PODRenderer';
+
+helper mango => sub { state $mango = Mango->new(app->config->{mongolab}); };
+
+my $IP_ANTERIOR = undef;
+
+get '/camera' => sub {
+  my $c = shift;
+  $c->render(text => 'você esta aqui');
+};
+
+post "/camera/$BOT_KEY" => sub {
+  my $c = shift;
+  my $dados = $c->req->json;
+  # $c->app->log->debug('chegou trabalho:' . $c->dumper($dados));
+  my $texto = $dados->{message}->{text};
+  my $from = $dados->{message}->{from};
+
+  # verificar acoes a tomar
+  if ($texto =~ /^\/start/) {
+    notificar('Ola, eu sou o bot que vigia as cameras do condominio', $from->{id});
+  } elsif ($texto =~ /^\/ip/) {
+    if ($IP_ANTERIOR) {
+      notificar($IP_ANTERIOR, $from->{id});
+    } else {
+      notificar('no momento nao conheco o endereco :(', $from->{id});
+    }
+  } elsif ($texto =~ /^\/status/) {
+    if ($falhas_dns || !defined($IP_ANTERIOR)) {
+      notificar('nao estou conseguindo resolver o dns', $from->{id});
+    } elsif ($falha_http) {
+      notificar('cameras nao disponiveis', $from->{id});
+    } else {
+      notificar("As cameras estao disponivies em http://$IP_ANTERIOR:8080", $from->{id});
+    }
+  } elsif ($texto =~ /^\/ligar/) {
+    ligar_notificacao($from, 1);
+  } elsif ($texto =~ /^\/desligar/) {
+    ligar_notificacao($from, 0);
+  } else {
+    $c->app->log->debug("nao sei o que fazer: [$texto]");
+  }
+
+  $c->render(json => {ok => "true"});
+};
+
+Mojo::IOLoop->timer(1, sub {
+  monitorar();
+  Mojo::IOLoop->recurring(30, *monitorar);
+});
+
+app->log->debug('rodando');
+app->start;
+
+sub monitorar {
+  app->log->debug('monitorar situacao');
+  my $ip = endereco_ip();
+  if ($ip) {
+    app->log->debug("endereco: $ip");
+    $falhas_dns = 0;
+    if (!defined($IP_ANTERIOR)) {
+      $IP_ANTERIOR = $ip;
+    }
+  } else {
+    app->log->debug('falhou ao buscar o ip');
+    if (++$falhas_dns == 5) {
+      notificar('Ocorreram cinco falhas na consulta de DNS');
+    } elsif ($falhas_dns % 60 == 0) {
+      notificar("Ocorreram $falhas_dns falhas na consulta de DNS");
+    }
+    return;
+  }
+
+  # verificar se o dvr responde na 8080
+  app->ua->get("http://$ip:8080", sub {
+    my ($ua, $tx) = @_;
+    my $falhou = undef;
+    if ($tx->res->error || $tx->res->code ne '200') {
+      $falhou = 1;
+    } else {
+      unless ($tx->res->to_string() =~ /INTELBRAS/) {
+        $falhou = 1;
+      }
+    }
+
+    if ($falhou) {
+      unless ($falha_http) {
+        $falha_http = 1;
+        notificar('As cameras nao estao mais disponiveis');
+      }
+    } else {
+      if ($falha_http) {
+        $falha_http = undef;
+        $IP_ANTERIOR = $ip;
+        notificar("As cameras estao disponivies em http://$ip:8080");
+      } elsif (defined($IP_ANTERIOR) && $IP_ANTERIOR ne $ip) {
+        $IP_ANTERIOR = $ip;
+        notificar("O endereco mudou para http://$ip:8080");
+      }
+    }
+  }); 
+}
+
+sub endereco_ip {
+  #my $tx = app->ua->get("http://127.0.0.1:8080/dns");
+  #if ($tx->res->error) {
+  #  return '127.0.0.1';
+  #} else {
+  #  return $tx->res->body
+  #}
+
+  use Net::DNS;
+  my $res = Net::DNS::Resolver->new;
+  $res->nameservers(app->config->{dns});
+  my $reply = $res->search(app->config->{endereco_dvr});
+
+  if ($reply) {
+      foreach my $rr ($reply->answer) {
+          next unless $rr->type eq "A";
+          return $rr->address;
+      }
+  } else {
+      return undef;
+  }
+}
+
+sub notificar() {
+  my $texto = shift;
+  
+  # return app->log->debug("fingir notificar: $texto");
+ 
+  my @chats = @_;
+
+  if ($#chats == -1) {
+    app->log->debug('conectar mongolab');
+
+    # return &notificar($texto, 1001, 1002, 1003);
+
+    app->log->debug('buscar chats');
+    my $cursor = app->mango->db('cameras')->
+      collection('chat')->find({'notificar' => 'on'})->
+      fields({'telegram_chat_id' => 1, '_id' => 0});
+
+    $cursor->all(sub {
+      my ($cursor, $err, $docs) = @_;
+      if ($err) {
+        app->log->debug("erro ao  buscar dados no mongolab: $err");
+      } else {
+        foreach my $chat (@$docs) {
+          app->log->debug("achou: $chat->{telegram_chat_id}");
+          push @chats, $chat->{telegram_chat_id};
+        }
+        return notificar($texto, @chats) unless ($#chats == -1);
+      }
+      return;
+    });
+    return;
+  }
+
+  my $url = app->config->{telegram_api} . '/sendMessage';
+
+  app->log->debug('notificar: ' . $texto);
+
+  foreach my $chat_id (@chats) {
+    app->log->debug("enviar para $chat_id");
+    my $dados = {chat_id => $chat_id, text => $texto};
+
+    #app->log->debug("vai chamar $url");
+    app->ua->post($url => json => $dados => sub {
+      my ($ua, $tx) = @_;
+      if ($tx->res->error || $tx->res->code ne '200') {
+        app->log->debug('falha ao chamar telegram');
+      } else {
+        app->log->debug('telegram notificado');
+      }
+    });
+  }
+}
+
+sub ligar_notificacao() {
+  my ($from, $ligar) = @_;
+
+  app->log->debug('verificar se registro existe');
+  my $collection = app->mango->db('cameras')->collection('chat');
+
+  $collection->find_one({telegram_chat_id => $from->{id}}, sub {
+    my ($cursor, $err, $doc) = @_;
+    if (defined($doc)) {
+      app->log->debug('encontrou o registro: atualizar');
+    } else {
+      app->log->debug('criar registro');
+      $doc = {telegram_chat_id => $from->{id}, 
+        first_name => $from->{first_name},
+        last_name => $from->{last_name}};
+    }
+    $doc->{notificar} = $ligar ? 'on' : 'off';
+    app->log->debug('feito');
+    $collection->save($doc);
+  });
+
+  &notificar($ligar ? 'Notificacoes ligadas' : 'Notificacoes desligadas'
+    , $from->{id});
+}
