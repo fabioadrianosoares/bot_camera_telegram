@@ -3,7 +3,7 @@ use Mojolicious::Lite;
 use Mango;
 
 my $falhas_dns = 0;
-my $falha_http = undef;
+my $falha_http = 0;
 
 plugin 'Config';
 
@@ -96,19 +96,18 @@ sub monitorar {
     }
 
     if ($falhou) {
-      unless ($falha_http) {
-        $falha_http = 1;
+      if (++$falha_http == 2) {
         notificar('As cameras nao estao mais disponiveis');
       }
     } else {
-      if ($falha_http) {
-        $falha_http = undef;
+      if ($falha_http > 1) {
         $IP_ANTERIOR = $ip;
         notificar("As cameras estao disponivies em http://$ip:8080");
       } elsif (defined($IP_ANTERIOR) && $IP_ANTERIOR ne $ip) {
         $IP_ANTERIOR = $ip;
         notificar("O endereco mudou para http://$ip:8080");
       }
+      $falha_http = 0;
     }
   }); 
 }
